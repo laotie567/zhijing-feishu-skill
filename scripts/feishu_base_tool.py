@@ -4,10 +4,12 @@ Provides tools for searching tasks, reading records, updating task fields,
 and listing stores/pending work in a Feishu Bitable.  Uses the same
 lazy-import + BaseRequest pattern as ``feishu_doc_tool.py``.
 
-The Bitable was scaffolded by lark-cli; its tokens are hard-coded below so
-the agent never has to guess which Base/tables to touch.  All write tools
-guard on the caller confirming intent -- the agent's system prompt enforces a
-"show what you'll change, then write" flow.
+Base/table IDs are loaded at runtime from ``ids.json`` (install.sh copies it
+next to the skill), with a ``ZHIJING_BASE_TOKEN`` env fallback -- nothing is
+hard-coded to a specific tenant.  Write tools guard on the caller confirming
+intent -- that is a prompt-layer convention (the agent's system prompt
+enforces a "show what you'll change, then write" flow), not an identity
+check: the tools do not verify who the caller is or whether they own the task.
 
 The lark client is built per-call from ``FEISHU_APP_ID`` / ``FEISHU_APP_SECRET``
 so the tools work both inside the feishu-comment event context *and* when
@@ -18,6 +20,7 @@ import json
 import logging
 import os
 import threading
+from urllib.parse import quote
 
 from tools.registry import registry, tool_error, tool_result
 
@@ -81,6 +84,15 @@ _IDS = _load_ids()
 BASE_TOKEN = _IDS.get("base_token", "")
 TABLES = _IDS.get("tables", {})
 
+
+def _missing_ids_error(what):
+    return (
+        f"{what}未加载（ids.json 缺失或不完整）。请先运行 zhijing-deploy/install.sh 或 "
+        "build_bitable.py 生成 ids.json（工具从 ~/.hermes/skills/zhijing-hotel-ops/ids.json "
+        "读取），或设置环境变量 ZHIJING_BASE_TOKEN 指定 Base 后重试。"
+    )
+
+
 # Display names for the agent-facing docs.
 TABLE_LABELS = {
     "stores": "门店主表",
@@ -111,7 +123,17 @@ def _do_request(client, method, uri, paths=None, queries=None, body=None):
     from lark_oapi.core.enum import HttpMethod
     from lark_oapi.core.model.base_request import BaseRequest
 
-    http_method = HttpMethod.GET if method == "GET" else HttpMethod.POST
+    # Explicit method mapping -- never silently downgrade (e.g. PUT -> POST).
+    _METHODS = {
+        "GET": HttpMethod.GET,
+        "POST": HttpMethod.POST,
+        "PUT": HttpMethod.PUT,
+        "PATCH": HttpMethod.PATCH,
+        "DELETE": HttpMethod.DELETE,
+    }
+    http_method = _METHODS.get(str(method).upper())
+    if http_method is None:
+        raise ValueError(f"unsupported HTTP method: {method!r}")
     builder = (
         BaseRequest.builder()
         .http_method(http_method)
@@ -145,28 +167,26 @@ def _query_records(client, table_key, field_names, conditions=None, limit=50, so
 
     conditions: list of [field, op, value] triples (v3 filter shape).
     sort: list of {"field":..., "desc":...}.
-    Uses field_names to project the response (kept small + aligned).
+    Field projection uses repeated `field_id` query params (v3 wire format
+    has no projection parameter other than that), built by hand.
     """
-    queries = {
-        "limit": str(limit),
-        "offset": "0",
-        # project fields by name to keep responses small
-        "filter_fields": json.dumps(field_names, ensure_ascii=False),
-    }
+    params = [("limit", str(limit)), ("offset", "0")]
+    params += [("field_id", f) for f in field_names]
     if conditions:
-        queries["filter"] = json.dumps(
-            {"logic": "and", "conditions": conditions}, ensure_ascii=False
-        )
+        params.append(("filter", json.dumps(
+            {"logic": "and", "conditions": conditions},
+            ensure_ascii=False, separators=(",", ":"))))
     if sort:
-        queries["sort"] = json.dumps(
+        params.append(("sort", json.dumps(
             [{"field": s.get("field"), "desc": bool(s.get("desc", False))} for s in sort],
-            ensure_ascii=False,
-        )
-    table_id = TABLES[table_key]
+            ensure_ascii=False, separators=(",", ":"))))
+    query = "&".join(f"{k}={quote(str(v), safe='')}" for k, v in params)
+    table_id = TABLES.get(table_key, "")
+    if not table_id:
+        return -1, _missing_ids_error(f"表 {table_key} 的 table id"), []
     code, msg, data = _do_request(
         client, "GET",
-        f"/open-apis/base/v3/bases/{BASE_TOKEN}/tables/{table_id}/records",
-        queries=queries,
+        f"/open-apis/base/v3/bases/{BASE_TOKEN}/tables/{table_id}/records?{query}",
     )
     if code != 0:
         return code, msg, []
@@ -207,6 +227,48 @@ def _decode_record(record, fields):
     return out
 
 
+# ---------------------------------------------------------------------------
+# Store keyword -> 门店主表 record_id resolution
+# ---------------------------------------------------------------------------
+
+def _resolve_store_record_id(keyword: str):
+    """Resolve a store keyword to its 门店主表 record_id.
+
+    Returns ``(record_id, error)``; exactly one of the two is None.
+
+    Matching is done on the short keys of ``ids.json["store_records"]``
+    (明逸/怡嘉/广元/绵阳/西博城), so both short names ("怡嘉") and contract
+    full names ("逸尚东方酒店（广元店）") resolve.  There is deliberately NO
+    fuzzy-text fallback: an unmatched keyword is an error, never a text search
+    on the link field (business rule in SKILL.md: match by record_id).
+    """
+    store_records = _IDS.get("store_records") or {}
+    if not store_records:
+        return None, (
+            "门店映射未加载（ids.json 缺少 store_records）——请先完成部署"
+            "（zhijing-deploy/install.sh 或 build_bitable.py 会生成 ids.json），"
+            "在此之前无法按门店精确查询。"
+        )
+    kw = (keyword or "").strip()
+    if not kw:
+        return None, "门店关键词为空。"
+    hits = [key for key in store_records if key in kw or kw in key]
+    if not hits:
+        return None, (
+            f"未找到门店「{kw}」。本工具只认已部署的 {len(store_records)} 家门店: "
+            f"{'、'.join(store_records)}（简称或合同全称均可），不支持任意文本模糊匹配。"
+        )
+    if len(hits) > 1:
+        return None, (
+            f"门店关键词「{kw}」同时匹配多店: {'、'.join(hits)}，请用更精确的名称。"
+        )
+    key = hits[0]
+    record_id = store_records.get(key) or ""
+    if not record_id:
+        return None, f"门店「{key}」的 record_id 为空，ids.json 不完整，请重新部署。"
+    return record_id, None
+
+
 # ===========================================================================
 # Tool 1: search_tasks
 # ===========================================================================
@@ -216,14 +278,14 @@ SEARCH_TASKS_SCHEMA = {
     "description": (
         "搜索筹备任务表中的任务。按门店、筹备阶段、责任方、任务状态、责任岗位等条件筛选。"
         "用户汇报进展时，先用此工具查到具体任务，再决定如何更新。"
-        "至少提供一个筛选条件；门店名支持模糊匹配（如'怡嘉'匹配'泸州市江阳区怡嘉精品酒店'）。"
+        "至少提供一个筛选条件；门店名须是已部署5家门店的简称或合同全称（如 '怡嘉'、'逸尚东方酒店（广元店）'），工具会解析为 record_id 精确匹配。"
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "store": {
                 "type": "string",
-                "description": "门店名称关键词，如 '怡嘉'、'广元'、'西博城'。可省略。",
+                "description": "门店简称或合同全称，如 '怡嘉'、'逸尚东方酒店（广元店）'。可省略。",
             },
             "stage": {
                 "type": "string",
@@ -231,7 +293,7 @@ SEARCH_TASKS_SCHEMA = {
             },
             "responsible_party": {
                 "type": "string",
-                "description": "责任方，可选值：致敬未来方/联营投资方/双方联合/待确认。可省略。",
+                "description": "责任方，可选值：智竞未来方/联营投资方/双方联合/待确认。可省略。",
             },
             "status": {
                 "type": "string",
@@ -257,7 +319,8 @@ def _handle_search_tasks(args: dict, **kwargs) -> str:
         return tool_error("Feishu client 未配置（缺少 FEISHU_APP_ID/SECRET）")
 
     # v3 filter uses [field, op, value] triples.
-    # select fields: "==" exact match; text/link fields: "intersects" for contains.
+    # select: "==" exact match; text: "intersects" for contains;
+    # link (所属门店): "==" on the store record_id (see _resolve_store_record_id).
     conditions = []
     store = args.get("store", "").strip()
     stage = args.get("stage", "").strip()
@@ -273,8 +336,12 @@ def _handle_search_tasks(args: dict, **kwargs) -> str:
     if status:
         conditions.append(["任务状态", "==", status])
     if store:
-        # 所属门店 is a link field; use intersects with the keyword as a name hint.
-        conditions.append(["所属门店", "intersects", [store]])
+        # 所属门店 is a link field: resolve the keyword to the store's
+        # record_id and match exactly (business rule: use record_id).
+        store_record_id, store_err = _resolve_store_record_id(store)
+        if store_err:
+            return tool_error(store_err)
+        conditions.append(["所属门店", "==", store_record_id])
     if keyword:
         conditions.append(["任务名称", "intersects", [keyword]])
 
@@ -324,9 +391,12 @@ def _handle_get_task(args: dict, **kwargs) -> str:
     if not rid:
         return tool_error("record_id 必填")
 
+    tasks_table = TABLES.get("tasks", "")
+    if not tasks_table:
+        return tool_error(_missing_ids_error("筹备任务表 table id"))
     code, msg, data = _do_request(
         client, "GET",
-        f"/open-apis/base/v3/bases/{BASE_TOKEN}/tables/{TABLES['tasks']}/records/{rid}",
+        f"/open-apis/base/v3/bases/{BASE_TOKEN}/tables/{tasks_table}/records/{rid}",
     )
     if code != 0:
         return tool_error(f"获取失败: code={code} msg={msg}")
@@ -345,7 +415,9 @@ UPDATE_TASK_SCHEMA = {
     "description": (
         "更新一条筹备任务的字段。常见更新：任务状态、实际完成日期、计划开始/完成日期、备注、进度。"
         "【重要】写入前必须先向用户确认要改的内容，用户同意后再调用本工具。"
-        "select 字段值必须用选项名（如 任务状态='已完成'）；日期用 'YYYY-MM-DD' 字符串。"
+        "select 字段值用选项名数组（如 任务状态=[\"已完成\"]）；日期用 'YYYY-MM-DD' 字符串。"
+        "注意：本工具不校验调用者是否为该任务的「责任人」（无可靠的调用者身份），"
+        "越权防护仅依赖可更新字段白名单与写入前的用户确认。"
     ),
     "parameters": {
         "type": "object",
@@ -355,7 +427,7 @@ UPDATE_TASK_SCHEMA = {
                 "type": "object",
                 "description": (
                     "要更新的字段键值对。键为字段名，值为目标值。例如 "
-                    '{"任务状态":"已完成","实际完成日期":"2026-07-25","备注":"甲方已确认进场"}。'
+                    '{"任务状态":["已完成"],"实际完成日期":"2026-07-25","备注":"..."}。'
                     "可更新字段：任务状态/计划开始日期/计划完成日期/实际完成日期/进度/备注/优先级。"
                 ),
             },
@@ -389,7 +461,7 @@ def _encode_value(field, value):
     if value is None or value == "":
         return None
     if kind == "select":
-        return value  # option name string
+        return value if isinstance(value, list) else [value]
     if kind == "datetime":
         # Bitable accepts "YYYY-MM-DD" or "YYYY-MM-DD HH:mm:ss".
         return value
@@ -415,6 +487,13 @@ def _handle_update_task(args: dict, **kwargs) -> str:
     if not summary:
         return tool_error("change_summary 必填（用于审计）")
 
+    # Guardrails, honest scope: (1) mutable-field whitelist below;
+    # (2) prompt-layer "confirm before write" convention.
+    # This tool does NOT verify the caller's identity, nor whether the caller
+    # is the task's 责任人 -- requests here carry no verifiable end-user
+    # identity.  Ownership checks can only be enabled once the 责任人 field
+    # is actually assigned (currently blank on all tasks); implementing one
+    # without that identity source would be security theater.
     # Guard: only allow known mutable fields.
     rejected = {k for k in updates if k not in _MUTABLE_FIELDS}
     if rejected:
@@ -429,11 +508,13 @@ def _handle_update_task(args: dict, **kwargs) -> str:
         if encoded is not None:
             fields_payload[k] = encoded
 
-    body = {"fields": fields_payload}
+    tasks_table = TABLES.get("tasks", "")
+    if not tasks_table:
+        return tool_error(_missing_ids_error("筹备任务表 table id"))
     code, msg, data = _do_request(
-        client, "PUT",
-        f"/open-apis/base/v3/bases/{BASE_TOKEN}/tables/{TABLES['tasks']}/records/{rid}",
-        body=body,
+        client, "PATCH",
+        f"/open-apis/base/v3/bases/{BASE_TOKEN}/tables/{tasks_table}/records/{rid}",
+        body=fields_payload,
     )
     if code != 0:
         return tool_error(f"更新失败: code={code} msg={msg}")
@@ -459,10 +540,10 @@ LIST_PENDING_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
-            "store": {"type": "string", "description": "门店关键词，如 '怡嘉'。可省略查全部。"},
+            "store": {"type": "string", "description": "门店简称或合同全称，如 '怡嘉'、'逸尚东方酒店（广元店）'。可省略查全部。"},
             "responsible_party": {
                 "type": "string",
-                "description": "责任方：致敬未来方/联营投资方。可省略。",
+                "description": "责任方：智竞未来方/联营投资方。可省略。",
             },
             "stage": {"type": "string", "description": "限定某个筹备阶段。可省略。"},
         },
@@ -482,7 +563,11 @@ def _handle_list_my_pending(args: dict, **kwargs) -> str:
     party = args.get("responsible_party", "").strip()
     stage = args.get("stage", "").strip()
     if store:
-        conditions.append(["所属门店", "intersects", [store]])
+        # Same rule as search_tasks: record_id exact match, never fuzzy text.
+        store_record_id, store_err = _resolve_store_record_id(store)
+        if store_err:
+            return tool_error(store_err)
+        conditions.append(["所属门店", "==", store_record_id])
     if party:
         conditions.append(["责任方", "==", party])
     if stage:
@@ -524,8 +609,8 @@ def _handle_list_stores(args: dict, **kwargs) -> str:
     if client is None:
         return tool_error("Feishu client 未配置")
     field_names = [
-        "门店名称", "城市", "致敬未来方签约主体", "联营投资方全称",
-        "合作房间数", "致敬未来方占股", "是否新设电竞酒店公司",
+        "门店名称", "城市", "智竞未来方签约主体", "联营投资方全称",
+        "合作房间数", "智竞未来方占股", "是否新设电竞酒店公司",
         "合同签订日", "开业目标日期", "距开业天数", "总体进度", "备注",
     ]
     code, msg, items = _query_records(client, "stores", field_names, limit=20)

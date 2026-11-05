@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""致敬未来 · 多维表格底座自动重建脚本。
+"""智竞未来 · 多维表格底座自动重建脚本。
 
 在客户机器上用客户自己的 lark-cli 凭证，从零重建整套多维表格系统：
-  6张表 + 公式字段 + 双向关联 + 5门店 + 250任务 + 仪表盘 + 自动化工作流
+  6张表 + 公式字段 + 双向关联 + 5门店 + 250任务 + 仪表盘（自动化工作流需按附录3手工配置）
 
 所有 lark-cli 命令均经过本机验证。每步捕获返回的 ID，最后写入 ids.json。
 
@@ -17,13 +17,11 @@ import json
 import os
 import subprocess
 import sys
-import time
 
 # 脚本位于 scripts/ 下，skill 根目录是上一级
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 HERE = os.path.dirname(SCRIPT_DIR)  # skill 根目录
 DATA = os.path.join(HERE, "data")
-TEMPLATES = os.path.join(HERE, "templates")
 LARK = "lark-cli"
 
 # 颜色常量（飞书 select hue 可用值）
@@ -77,6 +75,27 @@ def fail(msg, detail=""):
     sys.exit(1)
 
 
+def unpack_cell_text(value):
+    """把记录单元格值统一解包为纯文本。
+
+    回读文本字段时飞书可能返回字符串，也可能返回 ``[{"text": "..."}]``
+    这类嵌套结构；两种形态都要能取到名称，避免映射校验因形态差异误判。
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        for key in ("text", "value", "name"):
+            item = value.get(key)
+            if isinstance(item, str):
+                return item
+        return ""
+    if isinstance(value, (list, tuple)):
+        return "".join(unpack_cell_text(item) for item in value)
+    return str(value)
+
+
 # ===========================================================================
 # 字段定义（与本机已建系统完全一致）
 # ===========================================================================
@@ -87,15 +106,15 @@ STORE_FIELDS = [
         {"name": "泸州", "hue": H["blue"]}, {"name": "广元", "hue": H["orange"]},
         {"name": "绵阳", "hue": H["green"]}, {"name": "成都", "hue": H["purple"]}]},
     {"type": "text", "name": "详细地址"},
-    {"type": "select", "name": "致敬未来方签约主体", "multiple": False, "options": [
+    {"type": "select", "name": "智竞未来方签约主体", "multiple": False, "options": [
         {"name": "四川智竞未来企业管理有限公司", "hue": H["blue"]},
         {"name": "成都竞未来酒店管理有限公司", "hue": H["carmine"]}]},
-    {"type": "text", "name": "致敬未来方法定代表人"},
+    {"type": "text", "name": "智竞未来方法定代表人"},
     {"type": "text", "name": "联营投资方全称"},
     {"type": "text", "name": "联营投资方法定代表人"},
     {"type": "number", "name": "合作房间数", "style": {"type": "plain", "precision": 0}},
     {"type": "text", "name": "合作楼层"},
-    {"type": "number", "name": "致敬未来方占股", "style": {"type": "plain", "precision": 0, "percentage": True}},
+    {"type": "number", "name": "智竞未来方占股", "style": {"type": "plain", "precision": 0, "percentage": True}},
     {"type": "number", "name": "联营投资方占股", "style": {"type": "plain", "precision": 0, "percentage": True}},
     {"type": "select", "name": "是否新设电竞酒店公司", "multiple": False, "options": [
         {"name": "是", "hue": H["red"]}, {"name": "否", "hue": H["gray"]}]},
@@ -115,7 +134,7 @@ TASK_FIELDS = [
         {"name": "运营VI", "hue": H["green"]}, {"name": "OTA上线", "hue": H["wathet"]},
         {"name": "开业前检查", "hue": H["purple"]}]},
     {"type": "select", "name": "责任方", "multiple": False, "options": [
-        {"name": "致敬未来方", "hue": H["blue"]}, {"name": "联营投资方", "hue": H["orange"]},
+        {"name": "智竞未来方", "hue": H["blue"]}, {"name": "联营投资方", "hue": H["orange"]},
         {"name": "双方联合", "hue": H["green"]}, {"name": "待确认", "hue": H["gray"]}]},
     {"type": "select", "name": "责任岗位", "multiple": False, "options": [
         {"name": "选址岗", "hue": H["blue"]}, {"name": "设备采购岗", "hue": H["yellow"]},
@@ -164,7 +183,7 @@ MILESTONE_FIELDS = [
         {"name": "营业执照下发", "hue": H["wathet"]}, {"name": "OTA账号上线", "hue": H["blue"]},
         {"name": "试营业", "hue": H["purple"]}, {"name": "正式开业", "hue": H["carmine"]}]},
     {"type": "select", "name": "责任方", "multiple": False, "options": [
-        {"name": "致敬未来方", "hue": H["blue"]}, {"name": "联营投资方", "hue": H["orange"]},
+        {"name": "智竞未来方", "hue": H["blue"]}, {"name": "联营投资方", "hue": H["orange"]},
         {"name": "双方", "hue": H["green"]}]},
     {"type": "user", "name": "责任人", "multiple": True},
     {"type": "datetime", "name": "计划完成日期", "style": {"format": "yyyy-MM-dd"}},
@@ -179,7 +198,7 @@ MILESTONE_FIELDS = [
 ROLE_FIELDS = [
     {"type": "text", "name": "岗位名称"},
     {"type": "select", "name": "所属公司", "multiple": False, "options": [
-        {"name": "致敬未来方", "hue": H["blue"]}, {"name": "联营投资方", "hue": H["orange"]},
+        {"name": "智竞未来方", "hue": H["blue"]}, {"name": "联营投资方", "hue": H["orange"]},
         {"name": "双方共有", "hue": H["green"]}]},
     {"type": "text", "name": "默认上级岗位"},
     {"type": "text", "name": "职责说明"},
@@ -204,11 +223,11 @@ MEMBER_FIELDS = [
 ROLE_DATA = {
     "fields": ["岗位名称", "所属公司", "默认上级岗位", "职责说明"],
     "rows": [
-        ["选址岗", "致敬未来方", "运营经理", "负责新店选址评分、竞品调研、投资测算"],
-        ["设备采购岗", "致敬未来方", "运营经理", "负责云算力/OTN专线/云盒/主机/显示屏/外设/桌椅采购"],
-        ["技术网络岗", "致敬未来方", "运营经理", "负责后端网络配置、云游戏配置、设备调试、出具设备设施管理标准"],
-        ["运营VI岗", "致敬未来方", "运营经理", "负责一店两名命名、运营VI视觉、人员培训、管家招聘协调"],
-        ["OTA运营岗", "致敬未来方", "运营经理", "负责抖音/美团团购搭建、OTA房源上线、定价、内容运营"],
+        ["选址岗", "智竞未来方", "运营经理", "负责新店选址评分、竞品调研、投资测算"],
+        ["设备采购岗", "智竞未来方", "运营经理", "负责云算力/OTN专线/云盒/主机/显示屏/外设/桌椅采购"],
+        ["技术网络岗", "智竞未来方", "运营经理", "负责后端网络配置、云游戏配置、设备调试、出具设备设施管理标准"],
+        ["运营VI岗", "智竞未来方", "运营经理", "负责一店两名命名、运营VI视觉、人员培训、管家招聘协调"],
+        ["OTA运营岗", "智竞未来方", "运营经理", "负责抖音/美团团购搭建、OTA房源上线、定价、内容运营"],
         ["装修工程岗", "联营投资方", "场地方项目经理", "负责软装修升级、弱电改造、店招/公区标识/形象墙施工"],
         ["财务法务岗", "双方共有", "PMO", "负责合同签订、共管账户、证照办理、公众责任保险（部分门店）"],
     ],
@@ -231,6 +250,34 @@ FORMULA_STATUS = ('IFS(NOT(ISBLANK([实际完成日期])), "已完成", ISBLANK(
 FORMULA_DAYS_TO_OPEN = 'IF(ISBLANK([开业目标日期]), "", DATETIME_DIFF([开业目标日期], TODAY(), "days"))'
 FORMULA_STORE_PROGRESS = ('IF(COUNTA([关联筹备任务])=0, 0, '
                           'COUNTIF([关联筹备任务], CurrentValue.[任务状态]="已完成")/COUNTA([关联筹备任务]))')
+
+
+# ===========================================================================
+# 仪表盘组件（PMO全局进度看板固定 6 个组件）
+# data_config 依据官方 SSOT：lark-cli skills read lark-base/references/
+# lark-base-dashboard-block-config.md（聚合只读，无 filter，省略 position 由服务端自动布局）
+# ===========================================================================
+
+DASHBOARD_NAME = "PMO全局进度看板"
+DASHBOARD_BLOCKS = [
+    ("筹备任务总数", "statistics",
+     {"table_name": "筹备任务表", "count_all": True}),
+    ("任务状态分布", "pie",
+     {"table_name": "筹备任务表", "count_all": True,
+      "group_by": [{"field_name": "任务状态", "mode": "integrated"}]}),
+    ("各阶段任务数", "column",
+     {"table_name": "筹备任务表", "count_all": True,
+      "group_by": [{"field_name": "筹备阶段", "mode": "integrated"}]}),
+    ("责任方分工占比", "pie",
+     {"table_name": "筹备任务表", "count_all": True,
+      "group_by": [{"field_name": "责任方", "mode": "integrated"}]}),
+    ("催办状态分布", "column",
+     {"table_name": "筹备任务表", "count_all": True,
+      "group_by": [{"field_name": "催办状态", "mode": "integrated"}]}),
+    ("各岗位任务负载", "bar",
+     {"table_name": "筹备任务表", "count_all": True,
+      "group_by": [{"field_name": "责任岗位", "mode": "integrated"}]}),
+]
 
 
 def create_formula_field(base, table, name, expression):
@@ -257,9 +304,68 @@ def create_link_field(base, table, name, link_table, bidirectional_name):
     return resp["data"]["field"]["id"]
 
 
+def create_dashboard(base, ids):
+    """创建仪表盘与 6 个组件（增强项：失败只警告，不中断部署）。
+
+    每个组件先 `--dry-run` 验证 payload 可构造，再顺序实建（同一 dashboard
+    的 block 不允许并行创建）。全部建成返回 True 并写入 ids["dashboard"]；
+    任何一步失败都只打印警告并返回 False。
+    """
+    try:
+        resp = run_lark(["base", "+dashboard-create", "--base-token", base,
+                         "--name", DASHBOARD_NAME])
+        if not resp.get("ok"):
+            print(f"  ⚠️ 仪表盘创建失败（非致命）: "
+                  f"{json.dumps(resp.get('error', resp), ensure_ascii=False)[:200]}")
+            return False
+        dash = (resp.get("data") or {}).get("dashboard") or {}
+        dashboard_id = dash.get("dashboard_id") or dash.get("id") or ""
+        if not dashboard_id:
+            print("  ⚠️ 仪表盘创建返回缺少 dashboard_id（非致命）")
+            return False
+        ok(f"仪表盘 {DASHBOARD_NAME}: {dashboard_id}")
+
+        block_ids = {}
+        failed = []
+        for name, btype, data_config in DASHBOARD_BLOCKS:
+            args = [
+                "base", "+dashboard-block-create", "--base-token", base,
+                "--dashboard-id", dashboard_id, "--name", name, "--type", btype,
+                "--data-config", json.dumps(data_config, ensure_ascii=False),
+            ]
+            dry = run_lark(args + ["--dry-run"])
+            if not (dry.get("ok") and dry.get("dry_run")):
+                print(f"  ⚠️ 组件「{name}」dry-run 校验未通过，已跳过（非致命）: "
+                      f"{json.dumps(dry.get('error', dry), ensure_ascii=False)[:150]}")
+                failed.append(name)
+                continue
+            resp = run_lark(args)
+            if not resp.get("ok"):
+                print(f"  ⚠️ 组件「{name}」创建失败（非致命）: "
+                      f"{json.dumps(resp.get('error', resp), ensure_ascii=False)[:150]}")
+                failed.append(name)
+                continue
+            block = (resp.get("data") or {}).get("block") or {}
+            block_id = block.get("block_id") or block.get("id") or ""
+            if block_id:
+                block_ids[name] = block_id
+                ok(f"组件「{name}」: {block_id}")
+            else:
+                print(f"  ⚠️ 组件「{name}」返回缺少 block_id（非致命）")
+                failed.append(name)
+
+        ids["dashboard"] = {"id": dashboard_id, "blocks": block_ids}
+        if failed:
+            print(f"  ⚠️ 以下组件未建成（非致命）: {'、'.join(failed)}")
+        return not failed
+    except Exception as exc:  # 增强项：任何异常都不得中断主链路
+        print(f"  ⚠️ 仪表盘创建过程异常（非致命）: {exc}")
+        return False
+
+
 def main():
     print("=" * 60)
-    print("  致敬未来 · 多维表格底座自动重建")
+    print("  智竞未来 · 多维表格底座自动重建")
     print("=" * 60)
 
     # 预检 lark-cli 登录
@@ -276,12 +382,7 @@ def main():
     step("创建多维表格 + 门店主表")
     resp = run_lark([
         "base", "+base-create",
-        "--name", "致敬未来·电竞酒店联营项目筹备管理系统",
-        "--table-name", "门店主表",
-        "--time-zone", "Asia/Shanghai",
-    ], input_json=None) if False else run_lark([
-        "base", "+base-create",
-        "--name", "致敬未来·电竞酒店联营项目筹备管理系统",
+        "--name", "智竞未来·电竞酒店联营项目筹备管理系统",
         "--table-name", "门店主表",
         "--fields", json.dumps(STORE_FIELDS, ensure_ascii=False),
         "--time-zone", "Asia/Shanghai",
@@ -298,8 +399,7 @@ def main():
 
     # ===== 2. 建其余5张表 =====
     step("创建筹备任务表")
-    resp = run_lark(["base", "+table-create", "--base-token", base, "--name", "筹备任务表"],
-                    input_json=None) if False else run_lark([
+    resp = run_lark([
         "base", "+table-create", "--base-token", base, "--name", "筹备任务表",
         "--fields", json.dumps(TASK_FIELDS, ensure_ascii=False)])
     if not resp.get("ok"):
@@ -342,10 +442,12 @@ def main():
 
     # ===== 3. 建关联字段 =====
     step("创建表间双向关联")
+    deliverable_table = ids["tables"]["deliverables"]
     create_link_field(base, task_table, "所属门店", "门店主表", "关联筹备任务")
     create_link_field(base, task_table, "关联交付物", "交付物验收表", "关联任务")
     create_link_field(base, task_table, "关联里程碑", "阶段里程碑表", "关联任务")
     create_link_field(base, store_table, "关联里程碑", "阶段里程碑表", "所属门店")
+    create_link_field(base, deliverable_table, "所属门店", "门店主表", "关联交付物")
 
     # ===== 4. 建公式字段 =====
     step("创建任务表公式字段")
@@ -357,7 +459,7 @@ def main():
     create_formula_field(base, store_table, "距开业天数", FORMULA_DAYS_TO_OPEN)
     create_formula_field(base, store_table, "总体进度", FORMULA_STORE_PROGRESS)
 
-    # ===== 5. 写门店记录 =====
+    # ===== 5. 写门店记录 + 回读建立权威「门店名称 → record_id」映射 =====
     step("写入5家门店记录")
     stores_data = json.load(open(os.path.join(DATA, "stores.json")))
     resp = run_lark([
@@ -365,9 +467,59 @@ def main():
     ], input_json={"fields": stores_data["fields"], "rows": stores_data["rows"]})
     if not resp.get("ok"):
         fail("写入门店记录失败", json.dumps(resp, ensure_ascii=False)[:200])
-    store_record_ids = resp["data"].get("record_id_list", [])
-    ids["store_records"] = dict(zip(stores_data["store_keys"], store_record_ids))
-    ok(f"门店记录: {len(store_record_ids)} 条")
+    ok(f"门店记录: {len(resp['data'].get('record_id_list', []))} 条")
+
+    # 回读门店主表，用「门店名称 → record_id」建立权威映射。
+    # 不能依赖批量创建返回顺序：返回顺序一旦与传入不一致，250 条任务的
+    # 「所属门店」会整体挂错店且不报错（静默数据污染）。
+    step("回读门店主表，校验「门店名称 → record_id」映射")
+    resp = run_lark([
+        "base", "+record-list", "--base-token", base, "--table-id", store_table,
+        "--field-id", "门店名称", "--limit", "20", "--format", "json",
+    ])
+    if not resp.get("ok"):
+        fail("回读门店主表失败，无法建立权威 record_id 映射（已中止，尚未写入任何任务）",
+             json.dumps(resp.get("error", resp), ensure_ascii=False)[:200])
+    matrix = resp.get("data") or {}
+    read_rows = matrix.get("data") or []
+    read_ids = matrix.get("record_id_list") or []
+    read_fields = matrix.get("fields") or []
+    if not read_rows or not read_ids:
+        fail("回读门店主表返回 0 条记录，无法建立权威 record_id 映射（已中止，尚未写入任何任务）")
+    if "门店名称" in read_fields:
+        name_col = read_fields.index("门店名称")
+    else:
+        fail("回读结果中未找到「门店名称」列，无法反查（拒绝猜列，已中止，尚未写入任何任务）",
+             f"fields={read_fields}")
+
+    name_to_ids = {}
+    for i, row in enumerate(read_rows):
+        if i >= len(read_ids):
+            break
+        name = unpack_cell_text(row[name_col] if name_col < len(row) else None).strip()
+        if name:
+            name_to_ids.setdefault(name, []).append(read_ids[i])
+
+    store_name_col = stores_data["fields"].index("门店名称")
+    verified = {}
+    problems = []
+    for key, row in zip(stores_data["store_keys"], stores_data["rows"]):
+        expected = str(row[store_name_col]).strip()
+        matched = name_to_ids.get(expected, [])
+        if len(matched) == 1:
+            verified[key] = matched[0]
+        elif not matched:
+            problems.append(f"{key}「{expected}」未回读到")
+        else:
+            problems.append(f"{key}「{expected}」回读到 {len(matched)} 条重复记录")
+    if problems:
+        all_names = "、".join(f"{n}×{len(v)}" for n, v in name_to_ids.items()) or "（无）"
+        fail("门店 record_id 反查失败，已中止（尚未写入任何任务）",
+             "问题: " + "；".join(problems) + f"；回读到的门店名称: {all_names}")
+
+    ids["store_records"] = verified
+    ids["store_records_verified"] = True
+    ok(f"门店 record_id 映射已回读校验: {len(verified)} 家")
     for k, v in ids["store_records"].items():
         print(f"     {k}: {v}")
 
@@ -413,10 +565,15 @@ def main():
             fail(f"任务批次 {i} 写入失败", json.dumps(resp, ensure_ascii=False)[:200])
     ok(f"门店专属任务: {total_created} 条")
 
-    # ===== 8. 保存 ids.json =====
+    # ===== 8. 创建仪表盘（增强项：失败只警告，不中断部署） =====
+    step(f"创建仪表盘 {DASHBOARD_NAME}（增强项，失败非致命）")
+    if not create_dashboard(base, ids):
+        print("  ⚠️ 仪表盘未完整创建：请按《附录3》第六步在飞书中手工配置（不影响其余功能）。")
+
+    # ===== 9. 保存 ids.json =====
     ids["summary"] = {
         "tables": len(ids["tables"]),
-        "store_records": len(store_record_ids),
+        "store_records": len(ids["store_records"]),
         "task_records": total_created,
     }
     ids_path = os.path.join(HERE, "ids.json")

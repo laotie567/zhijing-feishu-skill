@@ -29,6 +29,10 @@ def main():
 
     ids = json.load(open(IDS_PATH))
 
+    # url 缺失时提示（不中断渲染：{{BASE_URL}} 将渲染为空字符串）
+    if not ids.get("url"):
+        print("⚠️ ids.json 缺少 url 字段或为空：Base 链接将渲染为空；请检查 build_bitable.py 是否正常完成")
+
     # 2. 检查模板
     if not os.path.isfile(TEMPLATE_PATH):
         print(f"❌ 找不到模板 {TEMPLATE_PATH}")
