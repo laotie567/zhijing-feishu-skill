@@ -32,13 +32,14 @@ H = {
 }
 
 
-def run_lark(args, input_json=None):
+def run_lark(args, input_json=None, as_user=True):
     """运行 lark-cli 命令，返回解析后的 JSON dict。
 
     args: lark-cli 之后的参数列表
     input_json: 若提供，写入临时文件用 @file 方式传 --json
+    as_user: 仅 API 命令带 --as user；auth status 等本地命令不接受该 flag
     """
-    cmd = [LARK] + args + ["--as", "user"]
+    cmd = [LARK] + args + (["--as", "user"] if as_user else [])
     if input_json is not None:
         tmp = os.path.join(HERE, ".tmp_payload.json")
         with open(tmp, "w") as f:
@@ -370,8 +371,10 @@ def main():
 
     # 预检 lark-cli 登录
     step("预检 lark-cli 登录状态")
-    resp = run_lark(["auth", "status"])
-    user_ok = resp.get("data", {}).get("identities", {}).get("user", {}).get("available", False)
+    resp = run_lark(["auth", "status"], as_user=False)
+    # auth status 的 identities 在顶层（无 data 包装）；兼容两种形态
+    identities = (resp.get("data") or resp).get("identities", {})
+    user_ok = identities.get("user", {}).get("available", False)
     if not user_ok:
         fail("lark-cli 用户身份未登录", "请先运行: lark-cli auth login")
     ok("lark-cli 用户身份就绪")
